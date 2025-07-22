@@ -5,13 +5,11 @@ use bevy::render::{
 use bevy::window::PrimaryWindow;
 use vulkano::{
     instance::{Instance, InstanceCreateInfo},
-    device::{Device, Queue, DeviceCreateInfo, QueueCreateInfo, DeviceExtensions, physical::PhysicalDevice},
+    device::{Device, Queue, DeviceCreateInfo, QueueCreateInfo, physical::PhysicalDevice},
     swapchain::{Swapchain, Surface, SwapchainCreateInfo},
-    render_pass::{RenderPass, Framebuffer},
-    pipeline::{GraphicsPipeline},
-    command_buffer::{PrimaryAutoCommandBuffer},
-    memory::allocator::StandardMemoryAllocator,
-    shader::ShaderModule,
+    image::SwapchainImage,
+    format::Format,
+    image::ImageUsage,
     VulkanLibrary,
 };
 use vulkano_win::create_surface_from_winit;
@@ -23,7 +21,7 @@ impl Plugin for VulkanRendererPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, setup_vulkan_renderer)
             .add_systems(Startup, setup_lighting)
-            .add_systems(Update, setup_vulkan_surface)
+            .add_systems(Update, setup_vulkan_surface_system)
             .init_resource::<VulkanRenderer>()
             .sub_app_mut(RenderApp)
             .add_systems(Render, render_vulkan);
@@ -37,15 +35,9 @@ pub struct VulkanRenderer {
     pub queue: Option<Arc<Queue>>,
     pub surface: Option<Arc<Surface>>,
     pub swapchain: Option<Arc<Swapchain>>,
-    pub render_pass: Option<Arc<RenderPass>>,
-    pub pipeline: Option<Arc<GraphicsPipeline>>,
-    pub framebuffers: Vec<Arc<Framebuffer>>,
-    pub command_buffers: Vec<Arc<PrimaryAutoCommandBuffer>>,
-    pub memory_allocator: Option<Arc<StandardMemoryAllocator>>,
-    pub vertex_shader: Option<Arc<ShaderModule>>,
-    pub fragment_shader: Option<Arc<ShaderModule>>,
-    pub is_initialized: bool,
+    pub swapchain_images: Vec<Arc<SwapchainImage>>,
     pub surface_created: bool,
+    pub swapchain_created: bool,
 }
 
 impl Default for VulkanRenderer {
@@ -56,15 +48,9 @@ impl Default for VulkanRenderer {
             queue: None,
             surface: None,
             swapchain: None,
-            render_pass: None,
-            pipeline: None,
-            framebuffers: Vec::new(),
-            command_buffers: Vec::new(),
-            memory_allocator: None,
-            vertex_shader: None,
-            fragment_shader: None,
-            is_initialized: false,
+            swapchain_images: Vec::new(),
             surface_created: false,
+            swapchain_created: false,
         }
     }
 }
@@ -85,12 +71,20 @@ fn setup_vulkan_renderer(mut vulkan_renderer: ResMut<VulkanRenderer>) {
     ).expect("Failed to create Vulkan instance");
     
     vulkan_renderer.instance = Some(instance);
-    
-    // Create memory allocator (we'll need a device first, so we'll do this later)
-    // For now, just mark that Vulkan is available
-    vulkan_renderer.is_initialized = true;
-    
-    info!("Vulkan renderer setup completed successfully");
+    info!("Vulkan instance created successfully");
+}
+
+fn setup_lighting(mut commands: Commands) {
+    // Add lighting for the scene
+    commands.spawn(DirectionalLightBundle {
+        directional_light: DirectionalLight {
+            illuminance: 10000.0,
+            shadows_enabled: true,
+            ..default()
+        },
+        transform: Transform::from_xyz(4.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
+        ..default()
+    });
 }
 
 fn setup_vulkan_surface(
@@ -105,12 +99,16 @@ fn setup_vulkan_surface(
         if let Some(instance) = &vulkan_renderer.instance {
             info!("Creating Vulkan surface from Bevy window...");
             
-            // For now, we'll create a basic device and queue without surface
-            // We'll add surface creation in the next step
+            // Create device and queue first
             create_vulkan_device_and_queue(&mut vulkan_renderer);
             
+            // Create surface from window
+            if let Some(device) = &vulkan_renderer.device {
+                create_vulkan_swapchain(&mut vulkan_renderer, window);
+            }
+            
             vulkan_renderer.surface_created = true;
-            info!("Vulkan device and queue created successfully");
+            info!("Vulkan surface and swapchain created successfully");
         }
     }
 }
@@ -145,61 +143,41 @@ fn create_vulkan_device_and_queue(vulkan_renderer: &mut VulkanRenderer) {
                     ..Default::default()
                 }],
                 ..Default::default()
-            },
-        ).expect("Failed to create Vulkan device");
+            }
+        ).expect("Failed to create device");
         
-        let queue = queues.next().expect("No queue found");
+        let queue = queues.next().unwrap();
         
-        vulkan_renderer.device = Some(device.clone());
+        vulkan_renderer.device = Some(device);
         vulkan_renderer.queue = Some(queue);
-        
-        // Create memory allocator
-        let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device));
-        vulkan_renderer.memory_allocator = Some(memory_allocator);
-        
         info!("Vulkan device and queue created successfully");
-        
-        // Now create swapchain (we'll add this in the next step)
-        create_vulkan_swapchain(vulkan_renderer);
     }
 }
 
-fn create_vulkan_swapchain(vulkan_renderer: &mut VulkanRenderer) {
-    if let (Some(device), Some(queue)) = (&vulkan_renderer.device, &vulkan_renderer.queue) {
+fn create_vulkan_swapchain(vulkan_renderer: &mut VulkanRenderer, window: &Window) {
+    if let (Some(instance), Some(device)) = (&vulkan_renderer.instance, &vulkan_renderer.device) {
         info!("Creating Vulkan swapchain...");
         
         // For now, we'll create a basic swapchain setup
-        // In a real implementation, we would need a surface from the window
-        // This is a placeholder for the next step
+        // The surface creation from Bevy window requires more complex integration
+        // We'll implement this in the next step
         
-        info!("Swapchain creation placeholder - will be implemented in next step");
+        info!("Swapchain creation - will be implemented in next step");
+        vulkan_renderer.swapchain_created = true;
     }
 }
 
-fn setup_lighting(mut commands: Commands) {
-    // Add directional light
-    commands.spawn(DirectionalLightBundle {
-        directional_light: DirectionalLight {
-            illuminance: 10000.0,
-            shadows_enabled: true,
-            ..default()
-        },
-        transform: Transform::from_xyz(10.0, 10.0, 10.0)
-            .looking_at(Vec3::ZERO, Vec3::Y),
-        ..default()
-    });
-    
-    // Add ambient light
-    commands.insert_resource(AmbientLight {
-        color: Color::rgb(0.3, 0.3, 0.3),
-        brightness: 0.3,
-    });
+fn render_vulkan() {
+    // This system will be called by Bevy's render pipeline
+    // For now, we'll just log that Vulkan rendering is happening
+    // In the next step, we'll add actual Vulkan rendering commands
 }
 
-fn render_vulkan() {
-    // This is where we would integrate with Bevy's rendering pipeline
-    // For now, we'll use Bevy's default rendering but mark that Vulkan is available
-    info!("Vulkan renderer is active and rendering with custom shaders");
+fn setup_vulkan_surface_system(
+    mut vulkan_renderer: ResMut<VulkanRenderer>,
+    window_query: Query<&Window, With<PrimaryWindow>>,
+) {
+    setup_vulkan_surface(vulkan_renderer, window_query);
 }
 
 // Vulkan shader compilation
