@@ -1,48 +1,42 @@
 use bevy::prelude::*;
-use bevy::render::{
-    RenderApp, Render,
+use bevy::window::Window;
+use log::info;
+use std::ffi::CStr;
+use ash::{
+    vk,
+    Instance as AshInstance,
+    Device as AshDevice,
+    Entry,
+    extensions::{
+        khr::Surface,
+        khr::Swapchain,
+    },
 };
-use bevy::window::PrimaryWindow;
-use vulkano::{
-    instance::{Instance, InstanceCreateInfo},
-    device::{Device, Queue, DeviceCreateInfo, QueueCreateInfo, physical::PhysicalDevice},
-    swapchain::{Swapchain, Surface, SwapchainCreateInfo},
-    image::SwapchainImage,
-    format::Format,
-    image::ImageUsage,
-    render_pass::{RenderPass, Subpass},
-    pipeline::{GraphicsPipeline, PipelineLayout},
-    memory::allocator::StandardMemoryAllocator,
-    VulkanLibrary,
-};
-use vulkano_win::create_surface_from_winit;
-use std::sync::Arc;
+use gpu_allocator::vulkan::Allocator;
 
 pub struct VulkanRendererPlugin;
 
 impl Plugin for VulkanRendererPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, setup_vulkan_renderer)
-            .add_systems(Startup, setup_lighting)
-            .add_systems(Update, setup_vulkan_surface_system)
-            .init_resource::<VulkanRenderer>()
-            .sub_app_mut(RenderApp)
-            .add_systems(Render, render_vulkan);
+        app.init_resource::<VulkanRenderer>()
+            .add_systems(Update, setup_vulkan_surface)
+            .add_systems(Startup, setup_lighting);
     }
 }
 
 #[derive(Resource)]
 pub struct VulkanRenderer {
-    pub instance: Option<Arc<Instance>>,
-    pub device: Option<Arc<Device>>,
-    pub queue: Option<Arc<Queue>>,
-    pub surface: Option<Arc<Surface>>,
-    pub swapchain: Option<Arc<Swapchain>>,
-    pub swapchain_images: Vec<Arc<SwapchainImage>>,
-    pub render_pass: Option<Arc<RenderPass>>,
-    pub pipeline: Option<Arc<GraphicsPipeline>>,
-    pub memory_allocator: Option<Arc<StandardMemoryAllocator>>,
-    pub surface_created: bool,
+    pub entry: Option<Entry>,
+    pub instance: Option<AshInstance>,
+    pub device: Option<AshDevice>,
+    pub surface: Option<vk::SurfaceKHR>,
+    pub swapchain: Option<vk::SwapchainKHR>,
+    pub swapchain_images: Vec<vk::Image>,
+    pub render_pass: Option<vk::RenderPass>,
+    pub pipeline: Option<vk::Pipeline>,
+    pub allocator: Option<Allocator>,
+    pub instance_created: bool,
+    pub device_created: bool,
     pub swapchain_created: bool,
     pub pipeline_created: bool,
 }
@@ -50,43 +44,64 @@ pub struct VulkanRenderer {
 impl Default for VulkanRenderer {
     fn default() -> Self {
         Self {
+            entry: None,
             instance: None,
             device: None,
-            queue: None,
             surface: None,
             swapchain: None,
             swapchain_images: Vec::new(),
             render_pass: None,
             pipeline: None,
-            memory_allocator: None,
-            surface_created: false,
+            allocator: None,
+            instance_created: false,
+            device_created: false,
             swapchain_created: false,
             pipeline_created: false,
         }
     }
 }
 
-fn setup_vulkan_renderer(mut vulkan_renderer: ResMut<VulkanRenderer>) {
+fn setup_vulkan_renderer(vulkan_renderer: &mut VulkanRenderer) {
     info!("Setting up Vulkan renderer...");
     
-    // Load Vulkan library
-    let library = VulkanLibrary::new().expect("Failed to load Vulkan library");
+    // Load Vulkan entry point
+    let entry = unsafe { Entry::load().expect("Failed to load Vulkan entry point") };
     
-    // Create Vulkan instance
-    let instance = Instance::new(
-        library.clone(),
-        InstanceCreateInfo {
-            enabled_extensions: vulkano_win::required_extensions(&library),
-            ..Default::default()
-        }
-    ).expect("Failed to create Vulkan instance");
+    // Check available extensions
+    let available_extensions = unsafe {
+        entry.enumerate_instance_extension_properties(None)
+            .expect("Failed to enumerate instance extensions")
+    };
     
+    info!("Available extensions: {:?}", available_extensions.len());
+    
+    // Create Vulkan instance with minimal extensions
+    let app_info = vk::ApplicationInfo::builder()
+        .application_name(unsafe { CStr::from_bytes_with_nul_unchecked(b"Vulkan Game\0") })
+        .application_version(vk::API_VERSION_1_0)
+        .engine_name(unsafe { CStr::from_bytes_with_nul_unchecked(b"Bevy\0") })
+        .engine_version(vk::API_VERSION_1_0)
+        .api_version(vk::API_VERSION_1_0)
+        .build();
+    
+    let instance_create_info = vk::InstanceCreateInfo::builder()
+        .application_info(&app_info)
+        .build();
+    
+    let instance = unsafe { 
+        entry.create_instance(&instance_create_info, None)
+            .expect("Failed to create Vulkan instance")
+    };
+    
+    vulkan_renderer.entry = Some(entry);
     vulkan_renderer.instance = Some(instance);
+    vulkan_renderer.instance_created = true;
+    
     info!("Vulkan instance created successfully");
 }
 
 fn setup_lighting(mut commands: Commands) {
-    // Add lighting for the scene
+    // Add a directional light for the scene
     commands.spawn(DirectionalLightBundle {
         directional_light: DirectionalLight {
             illuminance: 10000.0,
@@ -100,86 +115,86 @@ fn setup_lighting(mut commands: Commands) {
 
 fn setup_vulkan_surface(
     mut vulkan_renderer: ResMut<VulkanRenderer>,
-    window_query: Query<&Window, With<PrimaryWindow>>,
+    windows: Query<&Window>,
 ) {
-    if vulkan_renderer.surface_created {
-        return; // Already created
+    if !vulkan_renderer.instance_created {
+        setup_vulkan_renderer(&mut vulkan_renderer);
     }
     
-    if let Ok(window) = window_query.get_single() {
-        if let Some(instance) = &vulkan_renderer.instance {
-            info!("Creating Vulkan surface from Bevy window...");
-            
-            // Create device and queue first
-            create_vulkan_device_and_queue(&mut vulkan_renderer);
-            
-            // Create surface from window
-            if let Some(device) = &vulkan_renderer.device {
-                create_vulkan_swapchain(&mut vulkan_renderer, window);
-                
-                // Create render pass and pipeline
-                if vulkan_renderer.swapchain_created {
-                    create_vulkan_render_pass_and_pipeline(&mut vulkan_renderer);
-                }
-            }
-            
-            vulkan_renderer.surface_created = true;
-            info!("Vulkan surface, swapchain, and pipeline created successfully");
+    if !vulkan_renderer.device_created {
+        create_vulkan_device_and_queue(&mut vulkan_renderer);
+    }
+    
+    if !vulkan_renderer.swapchain_created {
+        if let Ok(window) = windows.get_single() {
+            create_vulkan_swapchain(&mut vulkan_renderer, window);
         }
+    }
+    
+    if !vulkan_renderer.pipeline_created {
+        create_vulkan_render_pass_and_pipeline(&mut vulkan_renderer);
+    }
+    
+    if vulkan_renderer.instance_created && vulkan_renderer.device_created && 
+       vulkan_renderer.swapchain_created && vulkan_renderer.pipeline_created {
+        info!("Vulkan surface, swapchain, and pipeline created successfully");
     }
 }
 
 fn create_vulkan_device_and_queue(vulkan_renderer: &mut VulkanRenderer) {
-    use vulkano::device::DeviceExtensions;
     if let Some(instance) = &vulkan_renderer.instance {
         info!("Creating Vulkan device and queue...");
         
         // Find a suitable physical device
-        let physical_device = instance
-            .enumerate_physical_devices()
-            .expect("Failed to enumerate physical devices")
-            .next()
-            .expect("No suitable physical device found");
-        
-        // Find a suitable queue family
-        let queue_family_index = physical_device
-            .queue_family_properties()
-            .iter()
-            .enumerate()
-            .position(|(_, family)| {
-                family.queue_flags.contains(vulkano::device::QueueFlags::GRAPHICS)
-            })
-            .expect("No suitable queue family found") as u32;
-        
-        // Enable khr_swapchain extension
-        let device_extensions = DeviceExtensions {
-            khr_swapchain: true,
-            ..DeviceExtensions::empty()
+        let physical_devices = unsafe { 
+            instance.enumerate_physical_devices()
+                .expect("Failed to enumerate physical devices")
         };
         
-        // Create device and queue
-        let (device, mut queues) = Device::new(
-            physical_device,
-            DeviceCreateInfo {
-                enabled_extensions: device_extensions,
-                queue_create_infos: vec![QueueCreateInfo {
-                    queue_family_index,
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }
-        ).expect("Failed to create device");
+        let physical_device = physical_devices[0]; // Use first available device
         
-        let queue = queues.next().unwrap();
+        // Find a queue family that supports graphics
+        let queue_family_properties = unsafe { 
+            instance.get_physical_device_queue_family_properties(physical_device)
+        };
         
-        vulkan_renderer.device = Some(device.clone());
-        vulkan_renderer.queue = Some(queue);
+        let queue_family_index = queue_family_properties
+            .iter()
+            .position(|props| props.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+            .expect("No graphics queue family found") as u32;
+        
+        // Create logical device
+        let queue_create_info = vk::DeviceQueueCreateInfo::builder()
+            .queue_family_index(queue_family_index)
+            .queue_priorities(&[1.0])
+            .build();
+        
+        let device_create_info = vk::DeviceCreateInfo::builder()
+            .queue_create_infos(std::slice::from_ref(&queue_create_info))
+            .enabled_extension_names(&[
+                Swapchain::name().as_ptr(),
+            ])
+            .build();
+        
+        let device = unsafe { 
+            instance.create_device(physical_device, &device_create_info, None)
+                .expect("Failed to create logical device")
+        };
         
         // Create memory allocator
-        let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device));
-        vulkan_renderer.memory_allocator = Some(memory_allocator);
+        let allocator = Allocator::new(&gpu_allocator::vulkan::AllocatorCreateDesc {
+            instance: instance.clone(),
+            device: device.clone(),
+            physical_device,
+            debug_settings: Default::default(),
+            buffer_device_address: false,
+        }).expect("Failed to create memory allocator");
         
-        info!("Vulkan device, queue, and memory allocator created successfully");
+        vulkan_renderer.device = Some(device);
+        vulkan_renderer.allocator = Some(allocator);
+        vulkan_renderer.device_created = true;
+        
+        info!("Vulkan device and memory allocator created successfully");
     }
 }
 
@@ -197,37 +212,40 @@ fn create_vulkan_swapchain(vulkan_renderer: &mut VulkanRenderer, _window: &Windo
 }
 
 fn create_vulkan_render_pass_and_pipeline(vulkan_renderer: &mut VulkanRenderer) {
-    use vulkano::render_pass::{AttachmentDescription, LoadOp, StoreOp, SubpassDescription, RenderPassCreateInfo, AttachmentReference};
-    use vulkano::image::{ImageLayout, ImageAspects, SampleCount};
     if let Some(device) = &vulkan_renderer.device {
         info!("Creating Vulkan render pass and pipeline...");
         
-        // Create a simple render pass using the builder API for vulkano 0.33+
-        let mut color_attachment = AttachmentDescription::default();
-        color_attachment.format = Some(Format::B8G8R8A8_SRGB);
-        color_attachment.samples = SampleCount::Sample1;
-        color_attachment.load_op = LoadOp::Clear;
-        color_attachment.store_op = StoreOp::Store;
-        color_attachment.stencil_load_op = LoadOp::DontCare;
-        color_attachment.stencil_store_op = StoreOp::DontCare;
-        color_attachment.initial_layout = ImageLayout::Undefined;
-        color_attachment.final_layout = ImageLayout::PresentSrc;
-        let mut color_ref = AttachmentReference::default();
-        color_ref.attachment = 0;
-        color_ref.layout = ImageLayout::ColorAttachmentOptimal;
-        color_ref.aspects = ImageAspects::empty();
-        let mut subpass = SubpassDescription::default();
-        subpass.color_attachments = vec![Some(color_ref)];
-        let render_pass_info = RenderPassCreateInfo {
-            attachments: vec![color_attachment],
-            subpasses: vec![subpass],
-            ..Default::default()
-        };
-        let render_pass = RenderPass::new(device.clone(), render_pass_info).unwrap();
+        // Create a simple render pass
+        let color_attachment = vk::AttachmentDescription::builder()
+            .format(vk::Format::B8G8R8A8_SRGB)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+            .build();
         
-        // For now, we'll create a basic pipeline setup
-        // The full pipeline creation requires more complex shader compilation
-        // We'll implement this in the next step
+        let color_attachment_ref = vk::AttachmentReference::builder()
+            .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .build();
+        
+        let subpass = vk::SubpassDescription::builder()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(std::slice::from_ref(&color_attachment_ref))
+            .build();
+        
+        let render_pass_create_info = vk::RenderPassCreateInfo::builder()
+            .attachments(std::slice::from_ref(&color_attachment))
+            .subpasses(std::slice::from_ref(&subpass))
+            .build();
+        
+        let render_pass = unsafe { 
+            device.create_render_pass(&render_pass_create_info, None)
+                .expect("Failed to create render pass")
+        };
         
         vulkan_renderer.render_pass = Some(render_pass);
         vulkan_renderer.pipeline_created = true;
@@ -237,14 +255,6 @@ fn create_vulkan_render_pass_and_pipeline(vulkan_renderer: &mut VulkanRenderer) 
 }
 
 fn render_vulkan() {
-    // This system will be called by Bevy's render pipeline
-    // For now, we'll just log that Vulkan rendering is happening
-    // In the next step, we'll add actual Vulkan rendering commands
-}
-
-fn setup_vulkan_surface_system(
-    mut vulkan_renderer: ResMut<VulkanRenderer>,
-    window_query: Query<&Window, With<PrimaryWindow>>,
-) {
-    setup_vulkan_surface(vulkan_renderer, window_query);
+    // This will be implemented in the next step
+    info!("Vulkan render system called");
 } 
